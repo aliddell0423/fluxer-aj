@@ -152,15 +152,16 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ github.token }}
 
-      - name: build app assets (SPA dist)
+      - name: build and push app assets (SPA dist)
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc
         with:
           context: .
           file: fluxer_app_proxy/Dockerfile
           target: app-assets
-          push: false
-          load: true
-          tags: fluxer-app-assets:${{ needs.plan.outputs.version }}
+          push: true
+          provenance: mode=min
+          platforms: linux/amd64
+          tags: ghcr.io/${{ env.GHCR_OWNER }}/fluxer-app-proxy-self-hosted:${{ needs.plan.outputs.version }}-assets
           build-args: |
             BUILD_VERSION=${{ needs.plan.outputs.version }}
             SOURCE_SHA=${{ github.sha }}
@@ -187,7 +188,7 @@ jobs:
             SOURCE_SHA=${{ github.sha }}
             SOURCE_DATE=${{ steps.source.outputs.date }}
             FLUXER_SELF_HOSTED=true
-            APP_ASSETS_REF=fluxer-app-assets:${{ needs.plan.outputs.version }}
+            APP_ASSETS_REF=ghcr.io/${{ env.GHCR_OWNER }}/fluxer-app-proxy-self-hosted:${{ needs.plan.outputs.version }}-assets
             APP_ASSETS_PLATFORM=linux/amd64
           cache-from: type=registry,ref=ghcr.io/${{ env.GHCR_OWNER }}/fluxer-app-proxy-self-hosted:buildcache-amd64
           cache-to: type=registry,ref=ghcr.io/${{ env.GHCR_OWNER }}/fluxer-app-proxy-self-hosted:buildcache-amd64,mode=max,image-manifest=true,oci-mediatypes=true,ignore-error=true
