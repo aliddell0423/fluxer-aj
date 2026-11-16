@@ -33,6 +33,7 @@ jobs:
       version: ${{ steps.vars.outputs.version }}
       matrix: ${{ steps.vars.outputs.matrix }}
       app_proxy: ${{ steps.vars.outputs.app_proxy }}
+      build_count: ${{ steps.vars.outputs.build_count }}
     steps:
       - name: set variables
         id: vars
@@ -79,11 +80,13 @@ jobs:
           echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
           echo "matrix=$(jq -c '{include: .}' <<< "${MATRIX}")" >> "$GITHUB_OUTPUT"
           echo "app_proxy=${APP_PROXY:-false}" >> "$GITHUB_OUTPUT"
+          echo "build_count=$(jq 'length' <<< "${MATRIX}")" >> "$GITHUB_OUTPUT"
           echo "Building version ${VERSION}"
 
   build:
     name: build ${{ matrix.image }}
     needs: plan
+    if: needs.plan.outputs.build_count != '0'
     runs-on: ubuntu-24.04
     timeout-minutes: 90
     permissions:
