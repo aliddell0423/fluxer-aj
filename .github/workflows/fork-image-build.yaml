@@ -1,0 +1,196 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Fork build pipeline: builds Fluxer service images to ghcr.io/<owner>/fluxer-*.
+# Unlike the upstream build-*.yaml workflows this skips release-baseline checks,
+# the upstream GitHub App token, and GitHub release publishing — those target
+# fluxerapp/fluxer and cannot work on a fork. amd64 only (self-hosting target).
+name: fork image build
+
+on:
+  workflow_dispatch:
+    inputs:
+      services:
+        description: "Comma-separated service names to build, or 'all'"
+        type: string
+        default: "all"
+      version:
+        description: "Override the CalVer build version (default: UTC now)"
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  GHCR_OWNER: ${{ github.repository_owner }}
+
+jobs:
+  plan:
+    name: resolve version and service list
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      version: ${{ steps.vars.outputs.version }}
+      matrix: ${{ steps.vars.outputs.matrix }}
+      app_proxy: ${{ steps.vars.outputs.app_proxy }}
+    steps:
+      - name: set variables
+        id: vars
+        env:
+          REQUESTED: ${{ inputs.services }}
+          OVERRIDE: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          if [ -n "${OVERRIDE}" ]; then
+            VERSION="${OVERRIDE}"
+          else
+            VERSION="$(date -u +%Y).$(date -u +%-m%-d | tr -d '-').$(date -u +%-H%M%S)"
+          fi
+          ALL='[
+            {"service":"admin","image":"fluxer-admin","dockerfile":"fluxer_admin/Dockerfile"},
+            {"service":"api","image":"fluxer-api","dockerfile":"fluxer_api/Dockerfile"},
+            {"service":"gateway","image":"fluxer-gateway","dockerfile":"fluxer_gateway/Dockerfile"},
+            {"service":"gifs","image":"fluxer-gifs","dockerfile":"fluxer_gifs/Dockerfile"},
+            {"service":"media-proxy","image":"fluxer-media-proxy","dockerfile":"fluxer_media_proxy/Dockerfile"},
+            {"service":"messages","image":"fluxer-messages","dockerfile":"fluxer_messages/Dockerfile"},
+            {"service":"push","image":"fluxer-push","dockerfile":"fluxer_push/Dockerfile"},
+            {"service":"snowflakes","image":"fluxer-snowflakes","dockerfile":"fluxer_snowflakes/Dockerfile"},
+            {"service":"static","image":"fluxer-static","dockerfile":"fluxer_static/Dockerfile"},
+            {"service":"unfurl","image":"fluxer-unfurl","dockerfile":"fluxer_unfurl/Dockerfile"},
+            {"service":"users","image":"fluxer-users","dockerfile":"fluxer_users/Dockerfile"}
+          ]'
+          if [ "${REQUESTED}" = "all" ] || [ -z "${REQUESTED}" ]; then
+            MATRIX="${ALL}"
+            APP_PROXY=true
+          else
+            WANTED="$(jq -R -s -c 'split(",") | map(gsub("^\\s+|\\s+$"; ""))' <<< "${REQUESTED}")"
+            MATRIX="$(jq -c --argjson wanted "${WANTED}" 'map(select(.service as $s | $wanted | index($s)))' <<< "${ALL}")"
+            COUNT="$(jq 'length' <<< "${MATRIX}")"
+            if [ "${COUNT}" = "0" ] && ! jq -e 'index("app-proxy")' <<< "${WANTED}" >/dev/null; then
+              echo "No matching services in: ${REQUESTED}" >&2
+              exit 1
+            fi
+            if jq -e 'index("app-proxy")' <<< "${WANTED}" >/dev/null; then
+              APP_PROXY=true
+            else
+              APP_PROXY=false
+            fi
+          fi
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "matrix=$(jq -c '{include: .}' <<< "${MATRIX}")" >> "$GITHUB_OUTPUT"
+          echo "app_proxy=${APP_PROXY:-false}" >> "$GITHUB_OUTPUT"
+          echo "Building version ${VERSION}"
+
+  build:
+    name: build ${{ matrix.image }}
+    needs: plan
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+
+      - name: resolve source date
+        id: source
+        run: echo "date=$(TZ=UTC git log -1 --no-show-signature --pretty=%cd --date=format-local:%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069
+
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - name: build and push image
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc
+        with:
+          context: .
+          file: ${{ matrix.dockerfile }}
+          push: true
+          provenance: mode=min
+          platforms: linux/amd64
+          tags: |
+            ghcr.io/${{ env.GHCR_OWNER }}/${{ matrix.image }}:${{ needs.plan.outputs.version }}
+            ghcr.io/${{ env.GHCR_OWNER }}/${{ matrix.image }}:fork-latest
+          build-args: |
+            BUILD_VERSION=${{ needs.plan.outputs.version }}
+            SOURCE_SHA=${{ github.sha }}
+            SOURCE_DATE=${{ steps.source.outputs.date }}
+          cache-from: type=registry,ref=ghcr.io/${{ env.GHCR_OWNER }}/${{ matrix.image }}:buildcache-amd64
+          cache-to: type=registry,ref=ghcr.io/${{ env.GHCR_OWNER }}/${{ matrix.image }}:buildcache-amd64,mode=max,image-manifest=true,oci-mediatypes=true,ignore-error=true
+        env:
+          DOCKER_BUILD_SUMMARY: false
+          DOCKER_BUILD_RECORD_UPLOAD: false
+
+  app-proxy:
+    name: build fluxer-app-proxy-self-hosted
+    needs: plan
+    if: needs.plan.outputs.app_proxy == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+
+      - name: resolve source date
+        id: source
+        run: echo "date=$(TZ=UTC git log -1 --no-show-signature --pretty=%cd --date=format-local:%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069
+
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - name: build app assets (SPA dist)
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc
+        with:
+          context: .
+          file: fluxer_app_proxy/Dockerfile
+          target: app-assets
+          push: false
+          load: true
+          tags: fluxer-app-assets:${{ needs.plan.outputs.version }}
+          build-args: |
+            BUILD_VERSION=${{ needs.plan.outputs.version }}
+            SOURCE_SHA=${{ github.sha }}
+            SOURCE_DATE=${{ steps.source.outputs.date }}
+          cache-from: type=registry,ref=ghcr.io/${{ env.GHCR_OWNER }}/fluxer-app-proxy-self-hosted:buildcache-amd64
+          cache-to: type=registry,ref=ghcr.io/${{ env.GHCR_OWNER }}/fluxer-app-proxy-self-hosted:buildcache-amd64,mode=max,image-manifest=true,oci-mediatypes=true,ignore-error=true
+        env:
+          DOCKER_BUILD_SUMMARY: false
+          DOCKER_BUILD_RECORD_UPLOAD: false
+
+      - name: build and push app proxy image
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc
+        with:
+          context: .
+          file: fluxer_app_proxy/Dockerfile
+          push: true
+          provenance: mode=min
+          platforms: linux/amd64
+          tags: |
+            ghcr.io/${{ env.GHCR_OWNER }}/fluxer-app-proxy-self-hosted:${{ needs.plan.outputs.version }}
+            ghcr.io/${{ env.GHCR_OWNER }}/fluxer-app-proxy-self-hosted:fork-latest
+          build-args: |
+            BUILD_VERSION=${{ needs.plan.outputs.version }}
+            SOURCE_SHA=${{ github.sha }}
+            SOURCE_DATE=${{ steps.source.outputs.date }}
+            FLUXER_SELF_HOSTED=true
+            APP_ASSETS_REF=fluxer-app-assets:${{ needs.plan.outputs.version }}
+            APP_ASSETS_PLATFORM=linux/amd64
+          cache-from: type=registry,ref=ghcr.io/${{ env.GHCR_OWNER }}/fluxer-app-proxy-self-hosted:buildcache-amd64
+          cache-to: type=registry,ref=ghcr.io/${{ env.GHCR_OWNER }}/fluxer-app-proxy-self-hosted:buildcache-amd64,mode=max,image-manifest=true,oci-mediatypes=true,ignore-error=true
+        env:
+          DOCKER_BUILD_SUMMARY: false
+          DOCKER_BUILD_RECORD_UPLOAD: false
